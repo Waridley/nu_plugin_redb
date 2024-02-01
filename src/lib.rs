@@ -53,29 +53,45 @@ fn open_table(db: &ReadTransaction, handle: UntypedTableHandle, span: Span) -> (
 	let first_guess  = db.open_table(TableDefinition::<&str, &[u8]>::new(name));
 	
 	let table = match first_guess {
-		Ok(table) => map_table(table, span),
+		Ok(table) => table_as_record(table, span),
 		Err(TableError::TableTypeMismatch { key, value, .. }) => {
-			let mut table = None;
-			macro_rules! guess_all_pairs {
-			    ($mac:ident: $($x:ty,)*) => {
-			        // Duplicate the list
-			        guess_all_pairs!(@inner $mac: $($x,)*; $($x,)*);
-			    };
-			
-			    // The end of iteration: we exhausted the list
-			    (@inner $mac:ident: ; $($x:ty,)*) => {};
+			let table = if key == <&str>::type_name() {
+				guess::<&str, &str>(db, name, &key, &value, span)
+					.or_else(|| guess_record::<bool>(db, name, &value, span))
+					.or_else(|| guess_record::<char>(db, name, &value, span))
+					.or_else(|| guess_record::<f32>(db, name, &value, span))
+					.or_else(|| guess_record::<f64>(db, name, &value, span))
+					.or_else(|| guess_record::<i8>(db, name, &value, span))
+					.or_else(|| guess_record::<i16>(db, name, &value, span))
+					.or_else(|| guess_record::<i32>(db, name, &value, span))
+					.or_else(|| guess_record::<i64>(db, name, &value, span))
+					.or_else(|| guess_record::<i128>(db, name, &value, span))
+					.or_else(|| guess_record::<u8>(db, name, &value, span))
+					.or_else(|| guess_record::<u16>(db, name, &value, span))
+					.or_else(|| guess_record::<u32>(db, name, &value, span))
+					.or_else(|| guess_record::<u64>(db, name, &value, span))
+					.or_else(|| guess_record::<u128>(db, name, &value, span))
+			} else {
+				let mut table = None;
+				macro_rules! guess_all_pairs {
+			    // The end of iteration: we exhausted the first list
+			    ([] => [$($y:ty,)*]) => {};
 			
 			    // The head/tail recursion: pick the first element of the first list
 			    // and recursively do it for the tail.
-			    (@inner $mac:ident: $head:ty, $($tail:ty,)* ; $($x:ty,)*) => {
+			    ([$head:ty, $($tail:ty,)*] => [$($y:ty,)*]) => {
 			        $(
-			            table = table.or_else(|| $mac::<$head, $x>(db, name, &key, &value, span));
+			            table = table.or_else(|| guess::<$head, $y>(db, name, &key, &value, span));
 			        )*
-			        guess_all_pairs!(@inner $mac: $($tail,)*; $($x,)*);
+			        guess_all_pairs!([$($tail,)*] => [$($y,)*]);
 			    };
-			}
-			// TODO: f32, f64
-			guess_all_pairs!(guess: &str, bool, char, i8, i16, i32, i64, i128, u8, u16, u32, u64, u128, (),);
+				}
+				guess_all_pairs!(
+					[bool, char, i8, i16, i32, i64, i128, u8, u16, u32, u64, u128, (),]
+					=> [&str, bool, char, f32, f64, i8, i16, i32, i64, i128, u8, u16, u32, u64, u128, (),]
+				);
+				table
+			};
 			
 			table.unwrap_or_else(|| Value::string("<unknown type>", span))
 		}
@@ -87,15 +103,41 @@ fn open_table(db: &ReadTransaction, handle: UntypedTableHandle, span: Span) -> (
 	(name.to_string(), table)
 }
 
-fn guess<K: RedbKey, V: RedbValue>(db: &ReadTransaction, name: &str, key: &TypeName, value: &TypeName, span: Span) -> Option<Value> {
+fn guess<K: RedbKey + 'static, V: RedbValue + 'static>(db: &ReadTransaction, name: &str, key: &TypeName, value: &TypeName, span: Span) -> Option<Value> {
 	if *key == K::type_name() && *value == V::type_name() {
-		db.open_table(TableDefinition::<&str, &[u8]>::new(name))
+		db.open_table(TableDefinition::<K, V>::new(name))
 		.map_err(|e| eprintln!("ERROR: {e}"))
 		.ok()
 		.map(|table| map_table(table, span))
 	} else {
 		None
 	}
+}
+
+fn guess_record<V: RedbValue + 'static>(db: &ReadTransaction, name: &str, value: &TypeName, span: Span) -> Option<Value> {
+	if *value == V::type_name() {
+		db.open_table(TableDefinition::<&str, V>::new(name))
+			.map_err(|e| eprintln!("ERROR: {e}"))
+			.ok()
+			.map(|table| table_as_record(table, span))
+	} else {
+		None
+	}
+}
+
+fn table_as_record<V: RedbValue>(table: ReadOnlyTable<&str, V>, span: Span) -> Value {
+	let Ok(table) = table.iter() else { return Value::string("❎ Table", span) };
+	let record = table.map(|row| {
+		let Ok((key, value)) = row else {
+			return ("❎ Key".to_string(), Value::string("❎ Value", span))
+		};
+		let key = key.value();
+		let value = value.value();
+		
+		let value = Value::string(String::from_utf8_lossy(V::as_bytes(&value).as_ref()), span);
+		(key.to_string(), value)
+	}).collect();
+	Value::record(record, span)
 }
 
 fn map_table<K: RedbKey, V: RedbValue>(table: ReadOnlyTable<K, V>, span: Span) -> Value {
